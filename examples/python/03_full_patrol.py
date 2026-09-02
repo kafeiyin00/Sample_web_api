@@ -12,7 +12,7 @@
     python3 03_full_patrol.py --robot ntu-dog-00001 --key cx_xxx_...
 
 流程：
-  ① 连接与体检 → ② 启动设备 → ③ 等启动完成
+  ① 连接与体检 →（①b 读状态：状态码表与隐性状态）→ ② 启动设备 → ③ 等启动完成
   → ④ 定位（告诉机器人在哪个航点附近，它据此收敛出全局定位）
   → ⑤ 确认定位可用 → ⑥ 下发巡检 → ⑦ 跟踪进度并抓全景 → ⑧ 收尾（停任务 + 停设备）
 
@@ -88,6 +88,27 @@ def main() -> int:
             print('  机器人不在线：先确认它已开机并联网，否则后面每一步都会 502')
             return 1
 
+        # ── ①b 读状态：先把权威状态码表拉下来，别在代码里抄表 ────────────────
+        step('①b', '读状态（状态码表 + 三个容易漏的隐性状态）')
+        codes = bot.status_codes()
+        print(f"  /v1/status-codes: {len(codes['status']['values'])} 个状态码、"
+              f"{len(codes['errorCode']['values'])} 个错误码（与机器人本地 SDK 同源）")
+        print('  ' + codes['status']['caveat'].replace('\n', ' '))
+
+        tele = bot.telemetry()
+        # 这三个在 telemetry 的 data 顶层，最容易被忽略，
+        # 但它们能解释掉大部分「明明下发成功了却不动」
+        print(f"  急停指令在下发: {tele.get('emergency_active')}"
+              '   ← true 时机器人端在以 20Hz 持续下发停止指令')
+        print(f"  ROS 可用       : {tele.get('ros_available')}"
+              '   ← false 时读到的都是陈旧值')
+        for topic in ('global_localization', 'odom'):
+            t = (tele.get('telemetry') or {}).get(topic) or {}
+            print(f"  话题 {topic:<20} received={t.get('received')}")
+        if tele.get('emergency_active'):
+            print('  ⚠️ 急停正在下发，巡检指令会和它竞争。'
+                  '先取消（POST /estop {"active": false}）再继续。')
+
         # ── ② 系统初始化：启动设备 ──────────────────────────────────────────
         step('②', '系统初始化（启动设备）')
         if args.sim:
@@ -147,6 +168,16 @@ def main() -> int:
         age = time.time() - float(gl.get('received_at') or 0)
         print(f'  定位数据年龄 {age:.1f}s（用 received_at 算，不是 stamp）')
 
+        # 感知状态：云端已经把反直觉的 0/1 翻成布尔了
+        pc = bot.perception()
+        print(f"  perception: Location={pc.get('Location')} → "
+              f"location_valid={pc.get('location_valid')}"
+              '   ← 原始值 0 才是「有效」，用布尔字段就不会搞反')
+        print(f"              ObsState={pc.get('ObsState')} → avoiding={pc.get('avoiding')}")
+        if not pc.get('location_valid'):
+            print('  注意：location_valid=false 是已知问题（该字段恒为无效），'
+                  '以上面的定位年龄为准')
+
         # ── ⑥ 下发巡检 ──────────────────────────────────────────────────────
         step('⑥', '下发巡检任务')
         path = pick_waypoints(wps, args.points)
@@ -165,13 +196,24 @@ def main() -> int:
         print(f'  HLS : {bot.hls_url()}')
         grabbed = False
         last_target = None
-        # 注意：状态词写进去是 running、读回来是 navigating，不能用 == 'running' 判断
+        warned_error = False
+        # 状态判断用云端给的 active / terminal 布尔字段，不要比 == 'running'
+        #（写进去是 running、读回来是 navigating，那个判断永远不成立）
         for st in bot.watch_task(interval=1.5, timeout=600):
+            prog = st.get('progress') or {}
+            # error_code 与 status 是**正交**的：还在导航的同时也可能已经有错误码
+            if st.get('error_code') and not warned_error:
+                warned_error = True
+                print(f"  ⚠️ 出现错误码 {st.get('error_hex')} "
+                      f"{st.get('error_name')}（{st.get('error_text')}）"
+                      f" —— 注意它与 status={st.get('status_name')} 是正交的")
             tgt = st.get('current_target')
             if tgt and tgt != last_target:
                 last_target = tgt
                 p = bot.position()
-                print(f"  → 前往 {tgt}  (index={st.get('current_index')})  "
+                print(f"  → 前往 {tgt}  "
+                      f"[{st.get('status_name')} active={st.get('active')} "
+                      f"进度 {prog.get('visited')}/{prog.get('total')}]  "
                       f"位置 x={p['x']:.2f} y={p['y']:.2f}")
                 # 在路上抓一张全景，证明画面与位置对得上
                 if not grabbed:
@@ -181,7 +223,15 @@ def main() -> int:
                         grabbed = True
                     except RobotError as e:
                         print(f'  抓帧失败（不影响巡检）: {e}')
-        print(f"  任务结束: status={st.get('status')}  已访问 {st.get('visited')}")
+        # 结束时把语义字段一起打出来：光看 status 字符串分不清是完成还是失败
+        print(f"  任务结束: status={st.get('status')} "
+              f"({st.get('status_code')} {st.get('status_name')} / {st.get('status_text')})")
+        print(f"           terminal={st.get('terminal')} "
+              f"error={st.get('error_hex')} {st.get('error_name')}")
+        print(f"           已访问 {st.get('visited')}")
+        if st.get('status_code') == 255:
+            print('  ⚠️ 255 既是「暂停」也是「失败」—— 具体原因看 error_code，'
+                  '0x234B 是避障失败、0x234C 是规划失败')
 
         if not grabbed:
             try:

@@ -446,12 +446,17 @@ class RobotClient:
             失败时写 failed   → 读回来是 "paused"
         所以判断「还在跑」要用 ACTIVE_STATUS，判断「结束了」要用 TERMINAL_STATUS，
         不要直接比 == 'running'，那样永远不成立。
+
+        云端现在会在响应里直接给 `terminal` / `active` 布尔字段（由状态码算出），
+        有就优先用它 —— 这样连状态词集合都不必自己维护。老网关没有这个字段时
+        回落到 TERMINAL_STATUS。
         """
         t0 = time.time()
         while time.time() - t0 < timeout:
             st = self.task()
             yield st
-            if st.get('status') in TERMINAL_STATUS:
+            done = st.get('terminal')
+            if done if isinstance(done, bool) else (st.get('status') in TERMINAL_STATUS):
                 return
             time.sleep(interval)
         raise RobotError(f'等待任务结束超时（{timeout}s）')

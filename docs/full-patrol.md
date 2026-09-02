@@ -8,6 +8,7 @@
 
 ```
 ① 连接与体检        确认在线
+①b 读状态           拉一次状态码表；看三个容易漏的隐性状态   ← 能解释掉大半「不动」
 ② 启动设备          在机器人上执行启动脚本，拉起导航等模块   ← 漏了它，任务不会执行
 ③ 等启动完成        轮询脚本状态（十几秒到一分多钟）
 ④ 定位              告诉机器人「你在哪个航点附近」，它据此收敛出全局定位
@@ -44,6 +45,32 @@ if not info['online']:
 ```
 
 `info()` 顺带把 `robotId` 缓存下来了 —— 后面透传通道要用，SDK 自动处理。
+
+---
+
+## ①b 读状态：开工前先看三个隐性状态
+
+这一步花十秒，能省掉后面大半的困惑。
+
+```python
+codes = bot.status_codes()          # /v1/status-codes，免鉴权，与机器人本地 SDK 同源
+tele = bot.telemetry()
+
+print(tele['emergency_active'])     # true 时机器人端在以 20Hz 持续下发停止指令
+print(tele['ros_available'])        # false 时读到的都是陈旧值
+print(tele['telemetry']['global_localization']['received'])   # 定位模块起来了没
+```
+
+| 字段 | 为什么开工前要看 |
+|------|----------------|
+| `emergency_active` | 为 `true` 时你的巡检速度指令会**和急停指令竞争**。它不是硬件急停也不是锁，所以任务照样能下发成功、机器人却走得莫名其妙。先取消：`POST /estop` 带 `{"active": false}` |
+| `ros_available` | 为 `false` 时机器人端 ROS 挂了。接口全部照常返回 200，但内容是最后一次成功读到的**陈旧值** —— 这是最容易误判的一种情况 |
+| `telemetry.<话题>.received` | 该话题从来有没有收到过数据。`false` = 对应模块没起来，第 ②③ 步很可能没成功 |
+
+**别把状态码表抄进自己代码** —— 抄一份就会漂移。`GET /v1/status-codes` 免鉴权，
+随时可取；而且下面第 ⑦ 步会看到，响应里其实已经附好了语义字段。
+
+完整的状态码表与解释见 [status.md](status.md)。
 
 ---
 
@@ -160,6 +187,14 @@ print(f"x={pos['x']:.2f} y={pos['y']:.2f} yaw={pos['yaw']:.2f}")
 curl -s -H "X-API-Key: $CX_KEY" "$CX_HOST/v1/robots/$CX_ROBOT/position"
 ```
 
+顺便看一眼感知状态。云端已经把反直觉的 0/1 翻成布尔了：
+
+```python
+pc = bot.perception()
+print(pc['Location'], '→', pc['location_valid'])   # 原始值 0 才是「有效」
+print(pc['ObsState'], '→', pc['avoiding'])
+```
+
 判断定位是否**持续**新鲜（比如巡检途中想确认没丢定位），用遥测里的 `received_at`：
 
 ```python
@@ -193,12 +228,37 @@ bot.start_patrol(map_name, path)
 
 ```python
 for st in bot.watch_task(interval=1.5):
-    print(st['status'], st['current_target'], st['visited'])
+    prog = st.get('progress') or {}
+    print(f"{st['status_name']} active={st['active']} "
+          f"进度 {prog.get('visited')}/{prog.get('total')} 目标={st['current_target']}")
+
+    # error_code 与 status 是**正交**的：还在导航的同时也可能已经有错误码
+    if st['error_code']:
+        print(f"⚠️ {st['error_hex']} {st['error_name']}（{st['error_text']}）")
+
+# 结束时光看 status 字符串分不清完成还是失败，要看码
+print(st['status_code'], st['status_name'], st['error_name'])
+if st['status_code'] == 255:
+    print('255 既是「暂停」也是「失败」，原因看 error_code')
 ```
 
 > ⚠️ **别用 `if status == 'running'`** —— 你下发的是 `running`，读回来是 `navigating`；
-> 失败读回来是 `paused`。用 `ACTIVE_STATUS` / `TERMINAL_STATUS` 集合判断，
-> 见 [状态词表](api-reference.md#任务状态词)。
+> 失败读回来是 `paused`。用云端附上的 `active` / `terminal` 布尔字段最省事，
+> 或者用 SDK 导出的 `ACTIVE_STATUS` / `TERMINAL_STATUS` 集合。
+> 详见 [status.md](status.md)。
+
+响应里除原始字段外，云端还附了这些（**只增不改**，原字段一律保留）：
+
+| 字段 | 例子 | 省掉了什么 |
+|------|------|-----------|
+| `status_code` / `status_name` / `status_text` | `3` / `NAVIGATING` / `导航中` | 自己维护字符串↔数值的映射 |
+| `active` / `terminal` | `true` / `false` | 自己维护「哪些状态算在跑」的集合 |
+| `error_name` / `error_text` / `error_hex` | `OBSTACLE_FAILURE` / `避障失败` / `0x234B` | 拿着 `9035` 去查表 |
+| `progress` | `{"visited": 2, "total": 3}` | 自己数数组长度 |
+| `gait_name` 等 | `FLAT` | 记住 `12290 = 0x3002 = 平地` |
+
+**想在到达每个航点时被通知，而不是轮询**：见 [arrival-events.md](arrival-events.md)。
+那条路延迟更低，而且一条长连接只占一个请求、不吃限流额度。
 
 同时可以抓全景画面：
 
@@ -253,6 +313,11 @@ finally:
 **每次巡检都要走一遍八步吗？**
 不用。② 到 ④ 是**一次性初始化**，机器人不重启、也没丢定位的话做一次就够。
 之后重复 ⑥⑦ 即可。收尾（⑧）只在你确定不再用它时做。
+
+**怎么知道任务是完成了还是失败了？**
+看 `status_code`：`4` 是完成，`255` 既是「暂停」也是「失败」——
+具体原因看 `error_code`（`0x234B` 避障失败、`0x234C` 规划失败）。
+光看 `status` 字符串区分不出来，因为失败读回来也是 `paused`。
 
 **巡检途中丢了定位怎么办？**
 重新做一次 ④ 就行 —— 用机器人**当前**最接近的航点当初值，不是原来的起点。
