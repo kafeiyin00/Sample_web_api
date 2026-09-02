@@ -159,10 +159,15 @@ node examples/node/01_hello.mjs --host $CX_HOST --robot $CX_ROBOT --key $CX_KEY
 | [examples/python/01_hello_raw.py](examples/python/01_hello_raw.py) | 只用 urllib，把 HTTP 层讲清楚 | 否 |
 | [examples/python/02_watch_position.py](examples/python/02_watch_position.py) | 持续读位置，示范正确的轮询与限流退避 | 否 |
 | [examples/python/03_full_patrol.py](examples/python/03_full_patrol.py) | 完整八步，含仿真模式 `--sim` | **是** |
+| [examples/python/04_verify_flow.py](examples/python/04_verify_flow.py) | 自检：逐条验证本教程说的和系统做的是否一致 | **是** |
 | [examples/node/01_hello.mjs](examples/node/01_hello.mjs) | 同 01_hello_raw.py，换成 Node | 否 |
 
 标「是」的会让**真实机器人走起来**：跑之前确认现场没人在它路径上、有人能按下物理急停。
 第一次接触建议先用 `03_full_patrol.py --sim` 在仿真里跑一遍，流程完全一致。
+
+接入一套新环境时，先跑 `04_verify_flow.py` —— 它把本教程的每条断言都对着真实系统
+核一遍（状态词、幂等重放、定位的成功与失败路径、`/perception` 的已知问题…），
+哪条不符会直接指出来，比逐条人工核对省事得多。
 
 想少写点样板代码，可以直接用 [`examples/python/certaintyx.py`](examples/python/certaintyx.py)
 这个单文件 SDK（标准库，拷进你的项目即可）：

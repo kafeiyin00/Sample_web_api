@@ -82,6 +82,8 @@ curl -s "$CX_HOST/api/robots/R30_2026_001/api/device/start_status?task_id=$TASK_
 > ⚠️ `completed: true` 只表示**脚本跑完了**，不代表成功。还要看 `result_success`。
 > 自己写轮询的话别忘了这一层 —— SDK 的 `wait_device()` 已经判断，失败抛 `RobotError`。
 
+`task_id` 不对时返回的是 **400**「任务 ID 不存在」，不是 404。
+
 ---
 
 ## ④ 定位：告诉机器人它在哪个航点附近
