@@ -340,6 +340,74 @@ class RobotClient:
             raise RobotError(f"定位失败: {r.get('error') or r.get('message')}{detail}", 0, r)
         return r.get('data') or {}
 
+    # ── 事件流（到达提醒等）─────────────────────────────────────────────────
+    def events(self, since: int | None = None, limit: int = 200) -> dict:
+        """取事件。返回 {'events': [...], 'seq': N, 'nextSince': N}。
+
+        since 省略时只从当下开始（不倒带历史），先记下返回的 seq，
+        之后每次带上 nextSince 就能保证一条不漏。
+        """
+        q = f'?since={int(since)}' if since is not None else ''
+        return self._data(self._request('GET', f'/events{q}')) or {}
+
+    def watch_events(self, *, since: int | None = None, interval: float = 1.0,
+                     timeout: float | None = None,
+                     types: set[str] | None = None) -> Iterator[dict]:
+        """持续产出事件，直到超时或调用方 break。
+
+        用轮询而不是 SSE：标准库没有 SSE 客户端，而这里只依赖标准库。
+        想要真正的推送（延迟更低、不吃限流额度）就直接连
+        `GET /v1/robots/{robot}/events?stream=1`，那是标准的 text/event-stream。
+
+        **断线不丢事件的关键**：内部始终用服务端给的 nextSince 续接，
+        而不是「从现在开始听」。所以中间断几秒也能补回来。
+        """
+        cursor = since
+        t0 = time.time()
+        if cursor is None:
+            cursor = int(self.events().get('seq') or 0)
+        while timeout is None or time.time() - t0 < timeout:
+            batch = self.events(since=cursor)
+            for e in batch.get('events') or []:
+                cursor = max(cursor, int(e.get('seq') or 0))
+                if types and e.get('type') not in types:
+                    continue
+                yield e
+            nxt = batch.get('nextSince')
+            if isinstance(nxt, int):
+                cursor = max(cursor, nxt)
+            time.sleep(interval)
+
+    def wait_arrival(self, waypoint: str | None = None, *, since: int | None = None,
+                     timeout: float = 600.0, interval: float = 1.0) -> dict:
+        """等一条「到达」事件。waypoint 为 None 表示任意航点。
+
+        任务在此期间失败会直接抛 RobotError —— 否则就会一直等到超时，
+        而真正的原因（避障失败、规划失败）早就在事件里了。
+        """
+        for e in self.watch_events(since=since, interval=interval, timeout=timeout,
+                                   types={'waypoint_reached', 'task_failed', 'task_completed'}):
+            if e['type'] == 'task_failed':
+                raise RobotError(
+                    f"任务失败: errorCode={e['data'].get('errorHex')}", 0, e)
+            if e['type'] == 'waypoint_reached' and (
+                    waypoint is None or str(e['data'].get('waypoint')) == str(waypoint)):
+                return e
+            if e['type'] == 'task_completed' and waypoint is not None:
+                raise RobotError(f'任务已结束但从未到达航点 {waypoint}', 0, e)
+        raise RobotError(f'等待到达超时（{timeout}s）')
+
+    def status_codes(self) -> dict:
+        """状态码/错误码权威表（免鉴权）。与机器人本地 SDK 同源。
+
+        拿它来把 status_code / error_code 翻成人能看的名字，
+        而不是在你自己的代码里抄一份表 —— 抄一份就会漂移。
+        """
+        url = f'{self.base}/v1/status-codes'
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as r:
+            return (json.loads(r.read().decode('utf-8')) or {}).get('data') or {}
+
     # ── 全景视频 ─────────────────────────────────────────────────────────────
     def rtsp_url(self) -> str:
         """全景 RTSP 拉流地址（只读，无需凭据）。"""

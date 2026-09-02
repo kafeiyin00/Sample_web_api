@@ -131,6 +131,24 @@ curl -s -X POST "$CX_HOST/v1/robots/$CX_ROBOT/task" \
 超了返回 **429** 并带 `Retry-After`（秒）。轮询间隔别小于 1 秒；
 收到 429 就照 `Retry-After` 退避，别硬重试。
 
+**要「到达通知」就别轮询** —— 用事件流（`GET …/events?stream=1`）：
+延迟低，而且一条长连接只占一个请求。见 [arrival-events.md](docs/arrival-events.md)。
+
+### 2.6 状态码不要自己抄一份表
+
+`error_code: 9035`、`gait: 12290` 这种裸值的权威定义在机器人本地 SDK 里。
+云端把整张表给你了，**免鉴权**：
+
+```bash
+curl -s "$CX_HOST/v1/status-codes"
+```
+
+而且 `GET …/task` 与 `GET …/perception` 的响应里已经附上了语义字段
+（`status_name`、`active`/`terminal`、`error_text`、`location_valid`…），
+多数情况下你连查表都不用。三个反直觉点见 [status.md](docs/status.md)：
+写 `running` 读回 `navigating`、`error_code` 与 `status` 正交、
+`Location=0` 才是「定位有效」。
+
 ---
 
 ## 3. 跑起来
@@ -160,6 +178,7 @@ node examples/node/01_hello.mjs --host $CX_HOST --robot $CX_ROBOT --key $CX_KEY
 | [examples/python/02_watch_position.py](examples/python/02_watch_position.py) | 持续读位置，示范正确的轮询与限流退避 | 否 |
 | [examples/python/03_full_patrol.py](examples/python/03_full_patrol.py) | 完整八步，含仿真模式 `--sim` | **是** |
 | [examples/python/04_verify_flow.py](examples/python/04_verify_flow.py) | 自检：逐条验证本教程说的和系统做的是否一致 | **是** |
+| [examples/python/05_arrival_events.py](examples/python/05_arrival_events.py) | 到达提醒：`--listen` 只听事件（否）；`--patrol` 下发巡检并跟踪（**是**） | 见左 |
 | [examples/node/01_hello.mjs](examples/node/01_hello.mjs) | 同 01_hello_raw.py，换成 Node | 否 |
 
 标「是」的会让**真实机器人走起来**：跑之前确认现场没人在它路径上、有人能按下物理急停。
@@ -190,6 +209,8 @@ for st in bot.watch_task():
 |------|------|
 | [docs/api-reference.md](docs/api-reference.md) | 每个端点的**真实**请求与响应（从生产环境抓的，逐字段说明） |
 | [docs/full-patrol.md](docs/full-patrol.md) | 让机器人真正走起来的完整八步 —— 只下发任务它是不会动的 |
+| [docs/status.md](docs/status.md) | 读状态：状态码/错误码表、三个反直觉点、怎么判断定位就绪 |
+| [docs/arrival-events.md](docs/arrival-events.md) | **到达提醒**：机器人走到航点时通知你，别再轮询 |
 | [docs/video.md](docs/video.md) | 全景画面：RTSP / HLS / 抓单帧 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 错误码与「明明没报错但不对」的症状对照表 |
 
@@ -206,4 +227,6 @@ for st in bot.watch_task():
 * **不要用 `if status == 'running'` 判断任务在跑** —— 永远不成立，见
   [api-reference.md 的状态词表](docs/api-reference.md#任务状态词)。
 * **不要靠轮询 `/perception` 的 `Location` 判断定位好了没** —— 见同一份文档里的说明。
-* **不要把轮询间隔设到 1 秒以下**，会撞限流。
+* **不要把轮询间隔设到 1 秒以下**，会撞限流 —— 想要低延迟就用事件流。
+* **不要在自己代码里抄一份状态码表**，会漂移。用 `GET /v1/status-codes`，
+  或者直接读响应里已经附上的 `*_name` / `*_text` 字段。

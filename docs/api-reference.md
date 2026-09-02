@@ -23,6 +23,8 @@
 * [POST …/task](#post-task) —— 下发巡检
 * [DELETE …/task](#delete-task) —— 停止任务
 * [POST …/estop](#post-estop) —— 急停
+* [GET /v1/status-codes](#get-v1status-codes) —— 状态码权威表，免鉴权
+* [GET …/events](#get-events) —— 事件流（到达提醒）
 * [控制权](#控制权)
 * [任务状态词](#任务状态词) ← **必读**
 * [判断定位是否就绪](#判断定位是否就绪) ← **必读**
@@ -285,7 +287,7 @@ curl -s "$CX_HOST/v1"
 
 | 字段 | 说明 |
 |------|------|
-| `status` | 见下面的[状态词表](#任务状态词)，**这里有个必须知道的不对称** |
+| `status` | 见下面的[状态词表](#任务状态词)，**这里有个必须知道的不对称**。云端另加了 `status_code` / `status_name` / `active` / `terminal`，见 [status.md](status.md) |
 | `path` | 你下发的完整航点序列 |
 | `visited` | 已经走过的航点。**下发瞬间就会包含起点** |
 | `current_target` | 正在前往的航点 |
@@ -365,6 +367,46 @@ curl -s -X POST "$CX_HOST/v1/robots/$CX_ROBOT/estop" \
 真正要确保机器人不动，得按物理急停按钮。
 
 急停生效后 `/telemetry` 的 `emergency_active` 变 `true`；取消后变回 `false`。
+
+---
+
+## GET /v1/status-codes
+
+机器人本地 SDK 的权威状态码表。**免鉴权** —— 对接方需要在登录之前就能看懂字段含义。
+
+```bash
+curl -s "$CX_HOST/v1/status-codes"
+```
+
+返回 `status`（7 个状态码 + activeCodes/terminalCodes + 写入别名）、
+`errorCode`（7 个）、`location`、`obsState`，以及 `control`
+（gait/speed/manner/obsMode/navMode 五项控制配置）。
+每组还带 `caveat` 说明容易踩的地方。
+
+完整解释见 [status.md](status.md)。**别把这张表抄进自己代码** —— 抄了就会漂移。
+
+---
+
+## GET …/events
+
+事件流：到达航点、任务完成/失败、避障、丢定位。
+
+```bash
+curl -s  -H "X-API-Key: $CX_KEY" "$CX_HOST/v1/robots/$CX_ROBOT/events?since=21"
+curl -sN -H "X-API-Key: $CX_KEY" "$CX_HOST/v1/robots/$CX_ROBOT/events?stream=1"
+```
+
+| 参数 | 说明 |
+|------|------|
+| `since` | 只要这个 `seq` 之后的事件。**省略时只从当下开始**，不倒带历史 |
+| `stream=1` | 改为 SSE 长连接（`text/event-stream`），事件一产生就推 |
+
+请求头 `Last-Event-ID` 也被当作 `since`（浏览器 `EventSource` 自动重连靠它）。
+
+只读权限即可（viewer 密钥能听）。SSE 是一条长连接、只占一个请求，
+所以听事件比高频轮询省得多。
+
+完整用法与事件类型表见 [arrival-events.md](arrival-events.md)。
 
 ---
 
