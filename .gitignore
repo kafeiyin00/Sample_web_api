@@ -1,0 +1,11 @@
+# 凭据：绝不提交
+examples/curl/env.sh
+.env
+*.key
+
+# 运行产物
+__pycache__/
+*.pyc
+*.jpg
+*.png
+*.m3u8
