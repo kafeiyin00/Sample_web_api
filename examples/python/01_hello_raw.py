@@ -92,7 +92,7 @@ def main():
     tele = (body.get('data') or {})
     topics = tele.get('telemetry') or {}
     print('\n\033[1m遥测要点\033[0m')
-    print(f"  急停激活: {tele.get('emergency_active')}   ← true 时机器人不会动")
+    print(f"  急停指令在下发: {tele.get('emergency_active')}   ← 软件标志，不是硬件急停")
     print(f"  ROS 可用: {tele.get('ros_available')}      ← false 时读到的都是陈旧值")
     print(f"  机器人自述状态: {topics.get('robot_info', {}).get('status')}（中文，给人看的）")
 
@@ -108,7 +108,7 @@ def main():
     # ── 4. 位姿：定位未就绪时是 503，这是正常状态不是故障 ───────────
     st, body = call(args.host, args.key, f'{R}/position')
     if st == 503:
-        print('\n\033[1m位姿\033[0m  [HTTP 503] 定位未就绪 —— 需要先做重定位，见 docs/full-patrol.md')
+        print('\n\033[1m位姿\033[0m  [HTTP 503] 定位未就绪 —— 需要先做定位（第 ④ 步），见 docs/full-patrol.md')
     else:
         p = body.get('data') or {}
         print(f"\n\033[1m位姿\033[0m  x={p.get('x'):.3f} y={p.get('y'):.3f} yaw={p.get('yaw'):.3f}"

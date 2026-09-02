@@ -86,7 +86,7 @@ def main():
         data = body.get('data') or {}
         gl = (data.get('telemetry') or {}).get('global_localization') or {}
         if not gl.get('received'):
-            print('定位话题还没有数据 —— 定位模块没起来，或需要先重定位')
+            print('定位话题还没有数据 —— 需要先做定位（告诉机器人在哪个航点附近），见 docs/full-patrol.md')
             time.sleep(args.interval)
             continue
 
@@ -100,7 +100,8 @@ def main():
 
         flags = []
         if data.get('emergency_active'):
-            flags.append('急停激活')     # 这时候机器人不会动，别以为是任务没下发成功
+            # 软件标志：机器人端正在持续下发停止指令。不是硬件急停，现场遥控会与之竞争
+            flags.append('急停指令在下发')
         if not data.get('ros_available'):
             flags.append('ROS 不可用')
         if not fresh:

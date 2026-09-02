@@ -16,7 +16,7 @@ CertaintyX 云端机器人 SDK（Python）
     for st in bot.watch_task():                 # 跟踪进度直到结束
         print(st['status'], st['current_target'])
 
-设计要点（都是踩过的坑，详细解释见本仓库 docs/api-reference.md）：
+设计要点（都是踩过的坑，改之前先看 docs/HANDOFF.md §6.3）：
 
 * **写操作要控制权**。密钥签发时选 `auto` 的话，网关会在每次写时代为接管，
   对接方不必自己实现续期循环；停止写入约 30 秒后自然释放。选 `explicit` 则要自己
@@ -289,7 +289,12 @@ class RobotClient:
         raise RobotError(f'等待设备脚本超时（{timeout}s）')
 
     def topic_ready(self, topic: str = '/global_localization') -> bool:
-        """某个 ROS 话题是否已有数据。定位起来前 /global_localization 不会就绪。"""
+        """某个 ROS 话题是否已有数据。
+
+        ⚠️ **别拿 /global_localization 当 localize() 的前置条件** ——
+        它是 localize() 的产物：你得先告诉机器人在哪个航点附近，它才开始收敛
+        并产出这个话题。刚开机的机器人上等它只会等到超时。
+        """
         r = self._passthrough('GET', f'/device/topic_ready?topic={urllib.parse.quote(topic)}')
         d = r.get('data') or {}
         return bool(d.get('ready', r.get('ready', False)))
@@ -306,18 +311,33 @@ class RobotClient:
             time.sleep(interval)
         raise RobotError(f'等待话题 {topic} 超时（{timeout}s）')
 
-    def localize(self, map_name: str, node_id: str, pose: dict,
+    def localize(self, map_name: str, node_id: str, pose: dict | None = None,
                  *, timeout: float = 60.0) -> dict:
         """
-        启动定位（重定位到指定航点）。服务端会同步等 fastlio 收敛出
-        /global_localization 并与给定初值比对，默认最长约 20 秒 ——
-        所以客户端超时必须给足（这里默认 60s），否则请求会被自己提前掐断。
+        定位：告诉机器人「你在 node_id 这个航点附近」，它据此收敛出全局位姿。
+
+        注意因果关系：/global_localization 是这一步的**产物**，不是前提。
+        调用它之前去等 /global_localization 出数据，在刚开机的机器人上会一直等到超时。
+
+        服务端内部：发 /relocalization（地图 pcd + 初值）→ 同步等一条新的
+        /global_localization（最长 20 秒）→ 与初值比对，水平偏差超 3 米判失败。
+        所以客户端超时必须给足（这里默认 60s），否则请求会被自己提前掐断，
+        看起来像「定位失败」其实是超时太短。
+
+        pose 省略时服务端自动取 node_id 那个航点的位姿 —— 一般不用传。
+        只有需要给一个不落在航点上的初值时才手工传。
         """
-        r = self._passthrough('POST', '/localization/execute',
-                              {'map_name': map_name, 'node_id': node_id, 'pose': pose},
-                              timeout=timeout)
+        payload: dict = {'map_name': map_name, 'node_id': node_id}
+        if pose is not None:
+            payload['pose'] = pose
+        r = self._passthrough('POST', '/localization/execute', payload, timeout=timeout)
         if not r.get('success'):
-            raise RobotError(f"定位失败: {r.get('error') or r.get('message')}", 0, r)
+            # reason=timeout（定位模块没起来/点云对不上）还是
+            # reason=drift_exceeded（node_id 给错了），失败原因差别很大
+            data = r.get('data') or {}
+            reason = data.get('reason') or ''
+            detail = f"（reason={reason}，drift={data.get('drift')}m）" if reason else ''
+            raise RobotError(f"定位失败: {r.get('error') or r.get('message')}{detail}", 0, r)
         return r.get('data') or {}
 
     # ── 全景视频 ─────────────────────────────────────────────────────────────

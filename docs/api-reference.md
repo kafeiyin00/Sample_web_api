@@ -188,7 +188,7 @@ curl -s "$CX_HOST/v1"
 注意 `source` 在**顶层**，不在 `data` 里面。`timestamp` 是 ROS 时间（同上）。
 
 **定位没就绪时这个端点返回 503**，`error` 为「机器人位置信息未就绪」。
-那不是故障，是还没做[重定位](full-patrol.md)。
+那不是故障，是还没做[定位](full-patrol.md)（第 ④ 步）。
 
 ---
 

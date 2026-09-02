@@ -5,15 +5,16 @@
 =================================
 教程正文见 ../../docs/full-patrol.md。这份是可直接跑的完整代码。
 
-    # 对着 Gazebo 仿真跑（跳过设备启动与重定位，仿真已提供定位）
+    # 对着 Gazebo 仿真跑（跳过设备启动与定位，仿真已提供定位）
     python3 03_full_patrol.py --robot ntu-dog-00001 --key cx_xxx_... --sim
 
     # 对着真机跑（八步全走）
     python3 03_full_patrol.py --robot ntu-dog-00001 --key cx_xxx_...
 
 流程：
-  ① 连接与体检 → ② 启动设备 → ③ 等启动完成 → ④ 等定位话题
-  → ⑤ 启动定位 → ⑥ 下发巡检 → ⑦ 跟踪进度并抓全景 → ⑧ 收尾（停任务 + 停设备）
+  ① 连接与体检 → ② 启动设备 → ③ 等启动完成
+  → ④ 定位（告诉机器人在哪个航点附近，它据此收敛出全局定位）
+  → ⑤ 确认定位可用 → ⑥ 下发巡检 → ⑦ 跟踪进度并抓全景 → ⑧ 收尾（停任务 + 停设备）
 
 ⑧ 放在 finally 里：任何一步出异常，设备都要停掉，否则机器人会一直空转。
 
@@ -68,7 +69,7 @@ def main() -> int:
                     help='Gazebo 仿真模式：跳过 ②③⑤（仿真器已直接提供定位）')
     ap.add_argument('--points', type=int, default=4, help='巡检点位数量（默认 4）')
     ap.add_argument('--start-node', default='',
-                    help='机器人当前所在的航点 ID（重定位用）；不给则用第一个航点')
+                    help='机器人当前所在（或最接近）的航点 ID，作为定位初值；不给则用第一个航点')
     ap.add_argument('--snapshot', default='pano.jpg', help='全景截图保存路径')
     args = ap.parse_args()
 
@@ -102,12 +103,7 @@ def main() -> int:
             bot.wait_device(device_task, starting=True, timeout=180)
             print('  设备启动完成')
 
-            # ── ④ 等定位话题就绪 ────────────────────────────────────────────
-            step('④', '等待定位话题就绪')
-            bot.wait_topic('/global_localization', timeout=120)
-            print('  /global_localization 已有数据')
-
-        # ── 取地图与航点（⑤⑥ 都要用） ──────────────────────────────────────
+        # ── 取地图与航点（④⑥ 都要用） ──────────────────────────────────────
         maps = bot.maps()
         map_name, wps = '', {}
         for m in maps:
@@ -120,8 +116,13 @@ def main() -> int:
             return 1
         print(f'\n  使用地图 {map_name}（{len(wps)} 个航点）')
 
-        # ── ⑤ 启动定位（重定位） ────────────────────────────────────────────
-        step('⑤', '启动定位（重定位到已知航点）')
+        # ── ④ 定位：告诉机器人它在哪个航点附近 ──────────────────────────────
+        #
+        # 因果关系别搞反：/global_localization 是这一步的**产物**，不是前提。
+        # 先给一个航点当初值，机器人才开始收敛并产出全局定位。
+        # 所以这里**不**在调用之前去等 /global_localization —— 刚开机的机器人上
+        # 那个话题还不会有数据，等它只会等到超时。
+        step('④', '定位（告诉机器人它在哪个航点附近）')
         if args.sim:
             print('  [仿真模式] 跳过：仿真器直接发布 /global_localization')
         else:
@@ -129,14 +130,22 @@ def main() -> int:
             if start_node not in wps:
                 print(f'  航点 {start_node} 不在地图里')
                 return 1
-            print(f'  重定位到航点 {start_node} —— 必须是机器人**真实所在**的点位，'
-                  '给错会收敛到错误位置')
-            # 服务端会同步等定位收敛（最长约 20s），客户端超时必须给足
-            bot.localize(map_name, start_node, wps[start_node]['pose'], timeout=60)
-            print('  定位成功')
+            print(f'  初值取航点 {start_node} —— 必须是机器人**真实所在**（或最接近）的点位；'
+                  '给错了要么偏差超 3m 被判失败，要么收敛到错的位置')
+            # 服务端内部：发 /relocalization → 同步等一条新的 /global_localization
+            #（最长 20s）→ 与初值比对，偏差超 3m 判失败。所以客户端超时必须给足。
+            # pose 省略即可，服务端会自己取该航点的位姿。
+            r = bot.localize(map_name, start_node, timeout=60)
+            print(f"  定位成功（与初值偏差 {r.get('drift')} m，阈值 {r.get('threshold')} m）")
 
+        # ── ⑤ 确认定位可用 ──────────────────────────────────────────────────
+        step('⑤', '确认定位可用')
+        # 定位好之前 /position 是 503；能读到坐标就说明收敛了
         pos = bot.position()
         print(f"  当前位置 x={pos['x']:.2f} y={pos['y']:.2f} yaw={pos['yaw']:.2f}")
+        gl = bot.telemetry()['telemetry']['global_localization']
+        age = time.time() - float(gl.get('received_at') or 0)
+        print(f'  定位数据年龄 {age:.1f}s（用 received_at 算，不是 stamp）')
 
         # ── ⑥ 下发巡检 ──────────────────────────────────────────────────────
         step('⑥', '下发巡检任务')

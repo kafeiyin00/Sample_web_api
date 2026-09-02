@@ -97,7 +97,7 @@ if (!d.online) {
   const data = body?.data ?? {};
   const gl = data.telemetry?.global_localization ?? {};
   console.log(`\n${bold('遥测要点')}`);
-  console.log(`  急停激活=${data.emergency_active}   ← true 时机器人不会动`);
+  console.log(`  急停指令在下发=${data.emergency_active}   ← 软件标志，不是硬件急停`);
   console.log(`  ROS 可用=${data.ros_available}`);
   console.log(`  自述状态=${data.telemetry?.robot_info?.status}（中文，给人看的）`);
   if (gl.received) {
