@@ -15,7 +15,7 @@
                     ← 漏了它，机器人不知道自己在哪
 ⑤ 确认定位可用      /position 从 503 变 200，/global_localization 开始有数据
 ⑥ 下发巡检          给一串航点
-⑦ 跟踪进度 + 取全景  轮询状态，同时抓画面
+⑦ 跟踪进度          每到一个航点收到一条**到点消息**（事件流），同时抓画面
 ⑧ 收尾              停任务 → 停设备 → 等停完
 ```
 
@@ -226,16 +226,61 @@ bot.start_patrol(map_name, path)
 
 ## ⑦ 跟踪进度 + 取全景
 
+### 到点消息：用事件流，不要轮询去猜
+
+机器人走到一个航点时会产生一条 `waypoint_reached` 事件。**别轮询 `/task` 比对
+`visited`** —— 那样到达时刻的精度就是你的轮询间隔，而想把间隔压小又会撞限流。
+
 ```python
-for st in bot.watch_task(interval=1.5):
-    prog = st.get('progress') or {}
-    print(f"{st['status_name']} active={st['active']} "
-          f"进度 {prog.get('visited')}/{prog.get('total')} 目标={st['current_target']}")
+# ⚠️ 游标必须在**下发之前**取。下发瞬间 visited 就包含起点，
+#    起点那条到达消息几乎立刻产生；先下发再取游标就会漏掉它。
+cursor = bot.events()['seq']
+bot.start_patrol(map_name, path)
 
-    # error_code 与 status 是**正交**的：还在导航的同时也可能已经有错误码
-    if st['error_code']:
-        print(f"⚠️ {st['error_hex']} {st['error_name']}（{st['error_text']}）")
+for e in bot.watch_events(since=cursor, timeout=600,
+                          types={'waypoint_reached', 'task_completed', 'task_failed',
+                                 'obstacle', 'localization'}):
+    d = e['data']
+    if e['type'] == 'waypoint_reached':
+        nxt = d['nextTarget']
+        print(f"到达 {d['waypoint']}（第 {d['index'] + 1}/{d['total']} 个）"
+              + (f"，下一个 {nxt}" if nxt else '，这是最后一个'))
+        st = bot.task()          # 顺手读一次状态，看语义字段
+        print(f"  {st['status_name']} active={st['active']} "
+              f"进度 {st['progress']['visited']}/{st['progress']['total']}")
+        # error_code 与 status 是**正交**的：还在导航的同时也可能已经有错误码
+        if st['error_code']:
+            print(f"  ⚠️ {st['error_hex']} {st['error_name']}（{st['error_text']}）")
+    elif e['type'] == 'obstacle':
+        print('开始避障' if d['avoiding'] else '避障结束')   # 「为什么走得慢」的答案
+    elif e['type'] == 'localization':
+        print('定位恢复' if d['valid'] else '⚠️ 丢定位了')
+    else:
+        break                    # task_completed / task_failed
+```
 
+跑起来是这样（仿真实测）：
+
+```
+  事件游标 seq=29（到点消息从这里之后开始收）
+  ✔ 到点消息：到达 1（第 1/3 个），下一个 8    位置 x=11.31 y=-0.30
+    状态 [NAVIGATING active=True 进度 1/3]
+  ✔ 到点消息：到达 8（第 2/3 个），下一个 12   位置 x=4.99 y=-0.50
+    状态 [NAVIGATING active=True 进度 2/3]
+  ✔ 到点消息：到达 12（第 3/3 个），这是最后一个  位置 x=8.78 y=-0.28
+    状态 [COMPLETED active=False 进度 3/3]
+  ■ 任务结束事件：task_completed
+```
+
+`watch_events` 内部始终用服务端给的 `nextSince` 续接，所以**中间断几秒也能补回来**。
+想要更低的延迟就直接连 SSE（`GET …/events?stream=1`），
+见 [arrival-events.md](arrival-events.md)。
+
+**起点也会报一条到达** —— 下发时 `visited` 立刻包含起点。想跳过就看 `d['index'] != 0`。
+
+### 还想看整体状态
+
+```python
 # 结束时光看 status 字符串分不清完成还是失败，要看码
 print(st['status_code'], st['status_name'], st['error_name'])
 if st['status_code'] == 255:
@@ -257,8 +302,8 @@ if st['status_code'] == 255:
 | `progress` | `{"visited": 2, "total": 3}` | 自己数数组长度 |
 | `gait_name` 等 | `FLAT` | 记住 `12290 = 0x3002 = 平地` |
 
-**想在到达每个航点时被通知，而不是轮询**：见 [arrival-events.md](arrival-events.md)。
-那条路延迟更低，而且一条长连接只占一个请求、不吃限流额度。
+老网关没有 `/events` 时，回退到 `bot.watch_task()` 轮询也能跑 ——
+示例脚本里就带了这个回退分支，只是到达时刻的精度会变成轮询间隔。
 
 同时可以抓全景画面：
 

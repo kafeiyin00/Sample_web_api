@@ -14,7 +14,9 @@
 流程：
   ① 连接与体检 →（①b 读状态：状态码表与隐性状态）→ ② 启动设备 → ③ 等启动完成
   → ④ 定位（告诉机器人在哪个航点附近，它据此收敛出全局定位）
-  → ⑤ 确认定位可用 → ⑥ 下发巡检 → ⑦ 跟踪进度并抓全景 → ⑧ 收尾（停任务 + 停设备）
+  → ⑤ 确认定位可用 → ⑥ 下发巡检
+  → ⑦ 跟踪进度：**每到一个航点收到一条到点消息**（事件流），同时抓全景
+  → ⑧ 收尾（停任务 + 停设备）
 
 ⑧ 放在 finally 里：任何一步出异常，设备都要停掉，否则机器人会一直空转。
 
@@ -187,48 +189,115 @@ def main() -> int:
                 wps[path[i + 1]]['pose']['position']['y'] - wps[path[i]]['pose']['position']['y'])
             for i in range(len(path) - 1))
         print(f'  路径: {" → ".join(path)}  （总长约 {total:.1f} m）')
+
+        # 记下事件游标 —— **必须在下发之前**。下发瞬间 visited 就包含起点，
+        # 起点那条到达消息几乎立刻产生；先下发再取游标就会漏掉它。
+        cursor = None
+        try:
+            cursor = int(bot.events().get('seq') or 0)
+            print(f'  事件游标 seq={cursor}（到点消息从这里之后开始收）')
+        except RobotError as e:
+            print(f'  取事件游标失败，将回退到轮询 /task: {e}')
+
         bot.start_patrol(map_name, path)
         print('  已下发')
 
-        # ── ⑦ 跟踪进度 + 取全景 ─────────────────────────────────────────────
-        step('⑦', '跟踪进度并取全景图')
+        # ── ⑦ 跟踪进度：到点消息 + 状态 ─────────────────────────────────────
+        step('⑦', '跟踪进度（到点消息用事件流，不是轮询猜）')
         print(f'  RTSP: {bot.rtsp_url()}')
         print(f'  HLS : {bot.hls_url()}')
+
         grabbed = False
-        last_target = None
         warned_error = False
-        # 状态判断用云端给的 active / terminal 布尔字段，不要比 == 'running'
-        #（写进去是 running、读回来是 navigating，那个判断永远不成立）
-        for st in bot.watch_task(interval=1.5, timeout=600):
+        reached = []
+
+        def maybe_snapshot():
+            """在路上抓一张全景，证明画面与位置对得上"""
+            nonlocal grabbed
+            if grabbed:
+                return
+            try:
+                bot.snapshot(args.snapshot)
+                print(f'    已保存全景截图 {args.snapshot}')
+                grabbed = True
+            except RobotError as e:
+                print(f'    抓帧失败（不影响巡检）: {e}')
+
+        def report_status(tag=''):
+            """读一次状态并打印语义字段。error_code 与 status 是正交的，两个都要看"""
+            nonlocal warned_error
+            st = bot.task()
             prog = st.get('progress') or {}
-            # error_code 与 status 是**正交**的：还在导航的同时也可能已经有错误码
+            print(f"    状态 [{st.get('status_name')} active={st.get('active')} "
+                  f"进度 {prog.get('visited')}/{prog.get('total')}] {tag}")
             if st.get('error_code') and not warned_error:
                 warned_error = True
-                print(f"  ⚠️ 出现错误码 {st.get('error_hex')} "
-                      f"{st.get('error_name')}（{st.get('error_text')}）"
-                      f" —— 注意它与 status={st.get('status_name')} 是正交的")
-            tgt = st.get('current_target')
-            if tgt and tgt != last_target:
-                last_target = tgt
-                p = bot.position()
-                print(f"  → 前往 {tgt}  "
-                      f"[{st.get('status_name')} active={st.get('active')} "
-                      f"进度 {prog.get('visited')}/{prog.get('total')}]  "
-                      f"位置 x={p['x']:.2f} y={p['y']:.2f}")
-                # 在路上抓一张全景，证明画面与位置对得上
-                if not grabbed:
-                    try:
-                        bot.snapshot(args.snapshot)
-                        print(f'  已保存全景截图 {args.snapshot}')
-                        grabbed = True
-                    except RobotError as e:
-                        print(f'  抓帧失败（不影响巡检）: {e}')
+                print(f"    ⚠️ 错误码 {st.get('error_hex')} {st.get('error_name')}"
+                      f"（{st.get('error_text')}）—— 它与 status={st.get('status_name')} 正交，"
+                      '所以「还在导航」和「已经出错」可以同时成立')
+            return st
+
+        final = None
+        if cursor is not None:
+            # ── 到点消息：事件流 ────────────────────────────────────────────
+            # 为什么不轮询 /task 比对 visited：到达时刻的精度就是轮询间隔，
+            # 而想把间隔压小又会撞限流。事件是机器人一到点就产生的。
+            #
+            # watch_events 内部始终用服务端给的 nextSince 续接，所以中间断几秒
+            # 也能补回来 —— 「到达」丢一条就等于没有。
+            # 想要更低延迟就直接连 SSE：GET /v1/robots/{robot}/events?stream=1
+            #（见 05_arrival_events.py 与 docs/arrival-events.md）
+            for e in bot.watch_events(
+                    since=cursor, interval=1.5, timeout=600,
+                    types={'waypoint_reached', 'task_completed', 'task_failed',
+                           'task_stopped', 'obstacle', 'localization'}):
+                d = e.get('data') or {}
+                if e['type'] == 'waypoint_reached':
+                    wp = d.get('waypoint')
+                    reached.append(wp)
+                    nxt = d.get('nextTarget')
+                    pos = bot.position()
+                    print(f"  ✔ 到点消息：到达 {wp}"
+                          f"（第 {int(d.get('index', 0)) + 1}/{d.get('total')} 个）"
+                          + (f'，下一个 {nxt}' if nxt else '，这是最后一个')
+                          + f"   位置 x={pos['x']:.2f} y={pos['y']:.2f}")
+                    report_status()
+                    maybe_snapshot()
+                elif e['type'] == 'obstacle':
+                    print('  ⚑ ' + ('开始避障（这就是「为什么走得慢」的答案）'
+                                    if d.get('avoiding') else '避障结束，继续前进'))
+                elif e['type'] == 'localization':
+                    print('  ⚑ ' + ('定位恢复' if d.get('valid') else '⚠️ 丢定位了'))
+                else:
+                    print(f"  ■ 任务结束事件：{e['type']}")
+                    final = bot.task()
+                    break
+            if final is None:
+                print('  等到超时也没收到任务结束事件 —— 机器人可能还在走，或者卡住了')
+                final = bot.task()
+        else:
+            # ── 回退：老网关没有 /events 时，退回轮询 ─────────────────────
+            print('  （无事件流，回退到轮询 /task —— 到达时刻的精度就是轮询间隔）')
+            last_target = None
+            for st in bot.watch_task(interval=1.5, timeout=600):
+                tgt = st.get('current_target')
+                if tgt and tgt != last_target:
+                    last_target = tgt
+                    pos = bot.position()
+                    print(f"  → 前往 {tgt}   位置 x={pos['x']:.2f} y={pos['y']:.2f}")
+                    report_status()
+                    maybe_snapshot()
+                final = st
+
         # 结束时把语义字段一起打出来：光看 status 字符串分不清是完成还是失败
+        st = final or {}
         print(f"  任务结束: status={st.get('status')} "
               f"({st.get('status_code')} {st.get('status_name')} / {st.get('status_text')})")
         print(f"           terminal={st.get('terminal')} "
               f"error={st.get('error_hex')} {st.get('error_name')}")
         print(f"           已访问 {st.get('visited')}")
+        if reached:
+            print(f"           收到 {len(reached)} 条到点消息: {reached}")
         if st.get('status_code') == 255:
             print('  ⚠️ 255 既是「暂停」也是「失败」—— 具体原因看 error_code，'
                   '0x234B 是避障失败、0x234C 是规划失败')
